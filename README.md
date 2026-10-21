@@ -19,3 +19,7 @@ plus a signing key (`KEYSTORE`, `KEYSTORE_PASS_FILE`).
 
 The app is a single activity with a WebView. It serves the packed site from `https://appassets.androidplatform.net/`
 so absolute paths, ES modules and saved games work as they do on the web. It has no permissions and makes no network requests.
+
+Game saves stay in the WebView's storage. The site's Saves page exports them to Downloads and imports a save file
+through Android's file picker. The app also copies every save to `saves-backup.json` in its own storage (on pause and
+every 3 minutes) and writes them back on start if the WebView's storage was emptied.

@@ -1,27 +1,48 @@
 package io.github.egebulut.thatonegame;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
 import android.view.View;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Toast;
 
+import org.json.JSONObject;
+import org.json.JSONTokener;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
  * Plays the ThatOneGame mobile site offline. The whole site is packed into assets/site and served
  * from a fake https origin, so absolute paths, ES modules and localStorage work as on the web.
+ * Game saves live in that origin's localStorage; the app mirrors it to a file in its own storage and
+ * puts it back if the WebView's data is ever cleared (see backup and restore).
  */
 public class MainActivity extends Activity {
     static final String HOST = "appassets.androidplatform.net";
@@ -49,7 +70,26 @@ public class MainActivity extends Activity {
         TYPES.put("txt", "text/plain");
     }
 
+    static final int PICK = 1, CREATE = 2;
+    static final long BACKUP_EVERY = 3 * 60 * 1000;
+    /** The page's whole localStorage as one JSON object string. */
+    static final String DUMP = "(function(){var o={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);"
+            + "o[k]=localStorage.getItem(k)}return JSON.stringify(o)})()";
+
     WebView web;
+    ValueCallback<Uri[]> picked; // the page's open file chooser
+    String pendingSave; // an export waiting for the save-as screen (before Android 10)
+    String lastBackup;
+    /** True once the backup was compared with localStorage: before that it must not be overwritten. */
+    boolean checked;
+    final Handler timer = new Handler(Looper.getMainLooper());
+    final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            backup();
+            timer.postDelayed(this, BACKUP_EVERY);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle state) {
@@ -77,6 +117,27 @@ public class MainActivity extends Activity {
                 // Links that leave the app (the GitHub release page) open in the browser.
                 startActivity(new Intent(Intent.ACTION_VIEW, req.getUrl()));
                 return true;
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (!checked && HOST.equals(Uri.parse(url).getHost())) restore();
+            }
+        });
+        web.setWebChromeClient(new WebChromeClient() {
+            /** "Import file" on the Saves page: any file type, since a .json save often arrives as text or octet-stream. */
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                if (picked != null) picked.onReceiveValue(null);
+                picked = cb;
+                Intent pick = new Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+                try {
+                    startActivityForResult(pick, PICK);
+                    return true;
+                } catch (ActivityNotFoundException e) {
+                    picked = null;
+                    return false;
+                }
             }
         });
         setContentView(web);
@@ -108,13 +169,147 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Called from the site: lock landscape while a landscape game runs, free rotation elsewhere. */
+    /** Called from the site (window.TOGApp). */
     class Bridge {
+        /** Lock landscape while a landscape game runs, free rotation elsewhere. */
         @JavascriptInterface
         public void orient(String mode) {
             runOnUiThread(() -> setRequestedOrientation("landscape".equals(mode)
                     ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                     : ActivityInfo.SCREEN_ORIENTATION_FULL_USER));
+        }
+
+        /**
+         * Saves an exported save file (assets/saves.js) for the player: into Downloads on Android 10 and newer
+         * (MediaStore, no permission needed), through Android's save-as screen before that. Returns "downloads",
+         * "picker", or "" when it could not be saved.
+         */
+        @JavascriptInterface
+        public String saveFile(String name, String text) {
+            if (name == null || text == null || !name.matches("[\\w.-]{1,100}\\.json") || text.length() > 10_000_000) return "";
+            if (Build.VERSION.SDK_INT < 29) {
+                runOnUiThread(() -> {
+                    pendingSave = text;
+                    try {
+                        startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                                .setType("application/json").putExtra(Intent.EXTRA_TITLE, name), CREATE);
+                    } catch (ActivityNotFoundException e) {
+                        pendingSave = null;
+                        toast("Could not save the file. Use Copy text instead.");
+                    }
+                });
+                return "picker";
+            }
+            // A second try with the time in the name, for when Downloads still lists a deleted file of that name.
+            for (String n : new String[] { name, name.replace(".json", "-" + System.currentTimeMillis() / 1000 + ".json") }) {
+                if (download(n, text)) {
+                    toast("Saved to Downloads: " + n);
+                    return "downloads";
+                }
+            }
+            toast("Could not save the file. Use Copy text instead.");
+            return "";
+        }
+    }
+
+    /** Writes a file into the shared Downloads folder through MediaStore (Android 10+, no permission needed). */
+    boolean download(String name, String text) {
+        ContentResolver cr = getContentResolver();
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+        v.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+        v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri uri = null;
+        try {
+            uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+            try (OutputStream out = cr.openOutputStream(uri)) {
+                out.write(text.getBytes(StandardCharsets.UTF_8));
+            }
+            v.clear();
+            v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            cr.update(uri, v, null, null);
+            return true;
+        } catch (Exception e) {
+            if (uri != null) cr.delete(uri, null, null);
+            return false;
+        }
+    }
+
+    void toast(String text) {
+        runOnUiThread(() -> Toast.makeText(this, text, Toast.LENGTH_LONG).show());
+    }
+
+    File backupFile() {
+        return new File(getFilesDir(), "saves-backup.json");
+    }
+
+    /** Copies the site's localStorage (every game's save and the site settings) to a file in the app's own storage. */
+    void backup() {
+        String url = web.getUrl();
+        if (!checked || url == null || !HOST.equals(Uri.parse(url).getHost())) return;
+        web.evaluateJavascript(DUMP, result -> {
+            try {
+                Object dump = new JSONTokener(result).nextValue();
+                if (!(dump instanceof String) || dump.equals(lastBackup)) return; // storage blocked, page gone, or no change
+                new JSONObject((String) dump); // only a whole JSON object replaces the last good copy
+                File f = backupFile();
+                File tmp = new File(f.getPath() + ".tmp");
+                try (FileOutputStream out = new FileOutputStream(tmp)) {
+                    out.write(((String) dump).getBytes(StandardCharsets.UTF_8));
+                    out.getFD().sync();
+                }
+                if (!tmp.renameTo(f)) throw new IOException("could not replace " + f);
+                lastBackup = (String) dump;
+            } catch (Exception e) {
+                // the previous backup stays as it was
+            }
+        });
+    }
+
+    /**
+     * Once per start, on the first page: when localStorage holds none of the backup's keys (an update or "clear data"
+     * wiped the WebView's storage), the backup is written back. When any of them is there, nothing is overwritten.
+     */
+    void restore() {
+        String json;
+        try (FileInputStream in = new FileInputStream(backupFile()); ByteArrayOutputStream buf = new ByteArrayOutputStream()) {
+            byte[] b = new byte[8192];
+            for (int n; (n = in.read(b)) > 0; ) buf.write(b, 0, n);
+            json = new JSONObject(buf.toString("UTF-8")).toString(); // checked and re-escaped before it goes into the page
+        } catch (Exception none) {
+            checked = true; // no backup yet, or a damaged one the next backup replaces
+            return;
+        }
+        web.evaluateJavascript("(function(b){try{var k=Object.keys(b),i;"
+                + "for(i=0;i<k.length;i++)if(localStorage.getItem(k[i])!==null)return 'kept';"
+                + "for(i=0;i<k.length;i++)localStorage.setItem(k[i],b[k[i]]);return k.length?'restored':'kept'}"
+                + "catch(e){return 'error'}})(" + json + ")", result -> {
+            if ("\"restored\"".equals(result)) {
+                toast("Your game saves were restored from the app's backup.");
+                web.reload();
+            }
+            if ("\"restored\"".equals(result) || "\"kept\"".equals(result)) checked = true;
+        });
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        Uri uri = res == RESULT_OK && data != null ? data.getData() : null;
+        if (req == PICK && picked != null) {
+            picked.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+            picked = null;
+        } else if (req == CREATE && pendingSave != null) {
+            String text = pendingSave;
+            pendingSave = null;
+            if (uri == null) return;
+            try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                out.write(text.getBytes(StandardCharsets.UTF_8));
+                toast("Save file saved.");
+            } catch (Exception e) {
+                toast("Could not save the file. Use Copy text instead.");
+            }
+        } else {
+            super.onActivityResult(req, res, data);
         }
     }
 
@@ -134,6 +329,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        backup();
+        timer.removeCallbacks(tick);
         super.onPause();
         web.onPause();
     }
@@ -142,6 +339,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         web.onResume();
+        timer.postDelayed(tick, BACKUP_EVERY);
     }
 
     @Override
