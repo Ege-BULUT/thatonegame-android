@@ -17,7 +17,10 @@ CODE="${CODE:-1}"
 
 rm -rf build assets
 mkdir -p build/classes build/dex assets
-rsync -a --exclude admin --exclude .DS_Store "$SITE/" assets/site/
+# Game folders the site's .vercelignore keeps out of a deploy (still being built) stay out of the app too.
+EXCLUDES=$(sed -n 's#^public/##p' "$SITE/../.vercelignore" 2>/dev/null | sed 's#^#--exclude=/#')
+# shellcheck disable=SC2086
+rsync -a --exclude admin --exclude .DS_Store $EXCLUDES "$SITE/" assets/site/
 
 "$BT/aapt2" compile --dir res -o build/res.zip
 "$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -R build/res.zip -A assets \
