@@ -6,12 +6,16 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.pm.ApplicationInfo;
+import android.content.res.ColorStateList;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
@@ -22,6 +26,11 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONObject;
@@ -41,12 +50,14 @@ import java.util.Map;
 /**
  * Plays the ThatOneGame mobile site offline. The whole site is packed into assets/site and served
  * from a fake https origin, so absolute paths, ES modules and localStorage work as on the web.
+ * On start it fetches the files the live site changed since (see Updater) and serves those instead.
  * Game saves live in that origin's localStorage; the app mirrors it to a file in its own storage and
  * puts it back if the WebView's data is ever cleared (see backup and restore).
  */
 public class MainActivity extends Activity {
     static final String HOST = "appassets.androidplatform.net";
     static final String START = "https://" + HOST + "/m/";
+    static final String SITE = "https://thatonegame.vercel.app/";
     static final Map<String, String> TYPES = new HashMap<>();
     static {
         TYPES.put("html", "text/html");
@@ -76,7 +87,11 @@ public class MainActivity extends Activity {
     static final String DUMP = "(function(){var o={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);"
             + "o[k]=localStorage.getItem(k)}return JSON.stringify(o)})()";
 
+    static Updater updater; // one per app process
+    static boolean updateChecked; // at most one update check per launch
+
     WebView web;
+    boolean playing;
     ValueCallback<Uri[]> picked; // the page's open file chooser
     String pendingSave; // an export waiting for the save-as screen (before Android 10)
     String lastBackup;
@@ -96,6 +111,7 @@ public class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         web = new WebView(this);
+        web.setBackgroundColor(0xff10172a); // the site's --page, so opening the games does not flash black
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -140,10 +156,90 @@ public class MainActivity extends Activity {
                 }
             }
         });
+        if (updater == null) {
+            try {
+                updater = new Updater(new File(getFilesDir(), "update"),
+                        Updater.read(getAssets().open("site/" + Updater.MANIFEST), 10 << 20));
+            } catch (Exception e) {
+                throw new IllegalStateException("the APK has no site manifest: build it with build.sh", e);
+            }
+        }
+        if (state != null) web.restoreState(state);
+        if (state != null || updateChecked) play();
+        else checkForUpdates();
+    }
+
+    /** Shows the games, and loads the start page unless the WebView already holds one. */
+    void play() {
+        if (playing || isFinishing() || isDestroyed()) return;
+        playing = true;
         setContentView(web);
         immersive();
-        if (state != null) web.restoreState(state);
-        else web.loadUrl(START);
+        if (web.getUrl() == null) web.loadUrl(START);
+    }
+
+    /** The short start screen: checks the site for changed files and downloads them, then opens the games. */
+    void checkForUpdates() {
+        updateChecked = true;
+        String url = SITE + Updater.MANIFEST, test = getIntent().getStringExtra("manifest");
+        // Only a test build (DEBUG=1 ./build.sh) takes another manifest URL, such as a local server (see README).
+        if (test != null && (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) url = test;
+        float dp = getResources().getDisplayMetrics().density;
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setBackgroundColor(0xff10172a); // the site's colours: --page, --panel, --accent
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(getApplicationInfo().icon);
+        TextView text = new TextView(this);
+        text.setText("Checking for updates");
+        text.setTextColor(0xfffffdf6);
+        text.setTextSize(16);
+        text.setPadding(0, (int) (16 * dp), 0, (int) (12 * dp));
+        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        bar.setIndeterminate(true);
+        bar.setMax(1000);
+        bar.setProgressTintList(ColorStateList.valueOf(0xffff8a00));
+        bar.setIndeterminateTintList(ColorStateList.valueOf(0xffff8a00));
+        Button skip = new Button(this);
+        skip.setText("Skip");
+        skip.setTextColor(0xffffc23d);
+        skip.setBackgroundColor(0);
+        skip.setVisibility(View.INVISIBLE);
+        skip.setOnClickListener(v -> {
+            updater.cancel();
+            play();
+        });
+        int wrap = LinearLayout.LayoutParams.WRAP_CONTENT;
+        box.addView(logo, new LinearLayout.LayoutParams((int) (96 * dp), (int) (96 * dp)));
+        box.addView(text, new LinearLayout.LayoutParams(wrap, wrap));
+        box.addView(bar, new LinearLayout.LayoutParams((int) (240 * dp), (int) (12 * dp)));
+        box.addView(skip, new LinearLayout.LayoutParams(wrap, wrap));
+        setContentView(box);
+        immersive();
+        String from = url;
+        new Thread(() -> {
+            int games = updater.update(from);
+            runOnUiThread(() -> {
+                if (games > 0 && !isFinishing()) toast("Updated: " + games + (games == 1 ? " game" : " games"));
+                play();
+            });
+        }).start();
+        long start = SystemClock.uptimeMillis();
+        timer.post(new Runnable() {
+            @Override
+            public void run() {
+                if (playing || isFinishing() || isDestroyed()) return;
+                long total = updater.total;
+                if (total > 0) {
+                    text.setText("Updating");
+                    bar.setIndeterminate(false);
+                    bar.setProgress((int) (updater.done * 1000 / total));
+                }
+                if (SystemClock.uptimeMillis() - start > 3000) skip.setVisibility(View.VISIBLE);
+                timer.postDelayed(this, 100);
+            }
+        });
     }
 
     /** Maps a URL path to a packed file the way the web host does: "/x/" serves x/index.html, "/x" serves x.html. */
@@ -154,7 +250,7 @@ public class MainActivity extends Activity {
                 : new String[] { path, path + ".html", path + "/index.html" };
         for (String p : tries) {
             try {
-                InputStream in = getAssets().open("site" + p);
+                InputStream in = open(p);
                 String ext = p.substring(p.lastIndexOf('.') + 1).toLowerCase();
                 String type = TYPES.containsKey(ext) ? TYPES.get(ext) : "application/octet-stream";
                 return new WebResourceResponse(type, type.startsWith("text/") || type.endsWith("json") ? "utf-8" : null, in);
@@ -163,10 +259,16 @@ public class MainActivity extends Activity {
             }
         }
         try {
-            return new WebResourceResponse("text/html", "utf-8", 404, "Not Found", null, getAssets().open("site/404.html"));
+            return new WebResourceResponse("text/html", "utf-8", 404, "Not Found", null, open("/404.html"));
         } catch (IOException e) {
             return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, null);
         }
+    }
+
+    /** A site file: the updated copy when there is one, else the one packed in the APK. */
+    InputStream open(String path) throws IOException {
+        File f = updater.local(path.substring(1));
+        return f != null ? new FileInputStream(f) : getAssets().open("site" + path);
     }
 
     /** Called from the site (window.TOGApp). */
@@ -340,6 +442,12 @@ public class MainActivity extends Activity {
         super.onResume();
         web.onResume();
         timer.postDelayed(tick, BACKUP_EVERY);
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (!playing) updater.cancel(); // closed during the update: stop it, the next app start tries again
+        super.onDestroy();
     }
 
     @Override
