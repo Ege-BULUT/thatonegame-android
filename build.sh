@@ -13,8 +13,8 @@ export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
 SITE="${SITE:-../thatonegame/public}"
 KEYSTORE="${KEYSTORE:-$HOME/.android/thatonegame-release.jks}"
 KEYSTORE_PASS_FILE="${KEYSTORE_PASS_FILE:-$HOME/.android/thatonegame-release.pass}"
-VERSION="${VERSION:-3.0.0}"
-CODE="${CODE:-13}"
+VERSION="${VERSION:-3.0.1}"
+CODE="${CODE:-14}"
 
 rm -rf build assets
 mkdir -p build/classes build/dex assets
