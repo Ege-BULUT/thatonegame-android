@@ -25,7 +25,7 @@
   ].join('');
   document.head.appendChild(css);
 
-  var mb = function (n) { return n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + ' KB' : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB'; };
+  var mb = function (n) { return n < 5e4 ? '<0.1 MB' : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB'; };
   var games = {}, errors = {}, timer = 0;
 
   function paint() {
