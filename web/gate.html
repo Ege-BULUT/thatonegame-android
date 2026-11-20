@@ -10,19 +10,26 @@
 <style>
   body { margin: 0; background: var(--page); }
   .mstart { background: radial-gradient(circle at 50% 20%, #26324f, var(--page) 75%); }
-  .tog-bar { width: min(300px, 70vw); height: 12px; margin: 14px auto 8px; background: #2a2a2a; border: 1px solid #000; border-radius: 6px; overflow: hidden; }
-  .tog-bar i { display: block; height: 100%; width: 0; background: linear-gradient(var(--accent-2), var(--accent)); transition: width .2s; }
-  .tog-bar.wait i { width: 30%; animation: tog-wait 1.2s ease-in-out infinite alternate; }
-  @keyframes tog-wait { to { margin-left: 70%; } }
+  /* The same ring as the game list (web/tog.js): the arc's dash offset is 100 - percent; before the first byte a
+     quarter arc, and the whole square SVG turns about its centre. */
+  .tog-dial { position: relative; width: 84px; height: 84px; margin: 14px auto 8px; }
+  .tog-ring { display: block; width: 100%; height: 100%; overflow: visible; }
+  .tog-ring circle { fill: none; stroke-width: 3; }
+  .tog-ring .tog-t { stroke: rgba(255,255,255,.2); }
+  .tog-ring .tog-v { stroke: var(--accent); stroke-dasharray: 100; stroke-dashoffset: 100; transition: stroke-dashoffset .3s linear; }
+  .tog-ring.tog-wait { animation: tog-turn 1s linear infinite; transform-origin: center; transform-box: fill-box; }
+  .tog-ring.tog-wait .tog-v { stroke-dasharray: 25 75; stroke-dashoffset: 0; transition: none; }
+  @keyframes tog-turn { to { transform: rotate(360deg); } }
+  .tog-dial span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font: bold 18px Verdana, sans-serif; color: #fff; }
   #msg { min-height: 1.4em; color: #c9d3f2; }
-  #retry[hidden], .tog-bar[hidden] { display: none; }
+  #retry[hidden], .tog-dial[hidden] { display: none; }
 </style>
 </head>
 <body>
 <div class="mstart" id="tog-gate"><div>
   <div class="shot"><img id="thumb" alt="" style="width:100%;height:100%;object-fit:cover"></div>
   <h1 id="title"></h1>
-  <div class="tog-bar wait" id="bar"><i></i></div>
+  <div class="tog-dial" id="bar"><svg class="tog-ring tog-wait" viewBox="0 0 36 36" aria-hidden="true"><circle class="tog-t" cx="18" cy="18" r="15.9155"/><circle class="tog-v" cx="18" cy="18" r="15.9155" transform="rotate(-90 18 18)"/></svg><span></span></div>
   <p id="msg">Getting the game ready</p>
   <button class="btn" id="retry" hidden>Try again</button>
 </div></div>
@@ -45,8 +52,10 @@
     if (s.s === 'busy') {
       started = true;
       $('bar').hidden = false;
-      $('bar').className = 'tog-bar' + (s.total ? '' : ' wait');
-      $('bar').firstChild.style.width = s.total ? Math.round(s.done * 100 / s.total) + '%' : '';
+      var p = s.total ? Math.min(100, Math.floor(s.done * 100 / s.total)) : -1, ring = $('bar').firstChild;
+      ring.classList.toggle('tog-wait', p < 0);
+      ring.lastChild.style.strokeDashoffset = p < 0 ? '' : 100 - p;
+      $('bar').lastChild.textContent = p < 0 ? '' : p + '%';
       $('msg').textContent = (s.installed ? 'Updating' : 'Downloading') + (s.total ? ' · ' + mb(s.done) + ' of ' + mb(s.total) : '');
       return setTimeout(tick, 250);
     }

@@ -22,7 +22,8 @@ plus a signing key (`KEYSTORE`, `KEYSTORE_PASS_FILE`).
 
 The app is a single activity with a WebView. It serves the site (the packed shell and the downloaded games)
 from `https://appassets.androidplatform.net/` so absolute paths, ES modules and saved games work as they do on the web.
-Its only permission is INTERNET, used for the updates and game downloads below.
+Its permissions are INTERNET, for the updates and game downloads below, and REQUEST_INSTALL_PACKAGES, for installing
+its own new versions.
 
 Game saves stay in the WebView's storage. The site's Saves page exports them to Downloads and imports a save file
 through Android's file picker. The app also copies every save to `saves-backup.json` in its own storage (on pause and
@@ -72,9 +73,31 @@ turns the old updater's downloads into reusable files and deletes the rest; game
 (their saves stay). A new APK is only needed when the app's own code changes (`src/`, `web/`, `AndroidManifest.xml`,
 `res/`, `build.sh`), or if the manifest's `format` changes.
 
+### New versions of the app
+
+The app also updates itself when a new APK is released, through Android's own install prompt (an app outside the
+Play Store cannot install silently):
+
+1. Each release publishes `assets/app-latest.json` on the site: `{versionCode, versionName, url, sha256, size, notes}`,
+   with the url of the release's versioned asset (`releases/download/vX.Y.Z/ThatOneGame.apk`). `./latest.sh "notes" >
+   app-latest.json` writes it from `build/ThatOneGame.apk`. Deploy it only after the GitHub release holds that exact
+   APK, so the url always exists. It is read from our own site, not the GitHub API (60 requests an hour per address).
+2. After the start update, in the background, the app fetches it at most once every 6 hours; offline nothing happens
+   (`AppUpdate.java`, state in `files/app-update.json`).
+3. If its versionCode is higher than the app's, the game list shows a banner: "Update available: 3.0.2 (3.4 MB)",
+   Update and Later. Later hides it for that version for 24 hours.
+4. Update downloads the APK into the app's cache with the same progress ring as the games, and keeps it only when its
+   size and sha256 match and it is this app at that version. A failed or wrong download is deleted with a short
+   message; an unverified APK is never installed.
+5. The app hands it to Android's PackageInstaller (a session, Android 5 and newer), which shows the install prompt.
+   Without the "install unknown apps" permission (Android 8 and newer, `REQUEST_INSTALL_PACKAGES`), the app says so in
+   one line and opens that setting for ThatOneGame; coming back resumes the install. Android installs it only if it
+   is signed with the same key, and keeps the app's data, saves included.
+
 ### Testing updates
 
-`test/io/github/egebulut/thatonegame/UpdaterTest.java` checks the update logic against a local server, with manifests written by the
+`test/io/github/egebulut/thatonegame/UpdaterTest.java` checks the update logic (and `AppUpdate`: the version compare,
+the 6-hour check, Later and the sha256 check) against a local server, with manifests written by the
 site's real `tools/offline_list.py`, and checks the released v2.0.0 updater against the same site: run `test/run.sh`
 (`TOOLS=` points at another copy of `offline_list.py`). For a test on a phone or emulator, `DEBUG=1 ./build.sh` (with a throwaway `KEYSTORE`)
 makes a debuggable build that allows plain http and takes the manifest URL from the launch, for example

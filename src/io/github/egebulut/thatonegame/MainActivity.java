@@ -1,12 +1,15 @@
 package io.github.egebulut.thatonegame;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
 import android.content.res.ColorStateList;
 import android.net.Uri;
 import android.os.Build;
@@ -15,6 +18,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -44,6 +48,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
@@ -92,6 +97,11 @@ public class MainActivity extends Activity {
     static Updater updater; // one per app process
     static boolean updateChecked; // at most one update check per launch
     static String manifestUrl; // the site's manifest; games download from the same site
+    static AppUpdate appUpdate; // new versions of the app itself
+    static final long[] apkProgress = new long[2];
+    static volatile String apkState = ""; // "busy" while the new APK downloads, "failed" after a failed download
+    static final String INSTALLED = "io.github.egebulut.thatonegame.INSTALLED";
+    File pendingApk; // waits for the "install unknown apps" permission
 
     WebView web;
     boolean playing;
@@ -160,6 +170,9 @@ public class MainActivity extends Activity {
             }
         });
         if (updater == null) {
+            appUpdate = new AppUpdate(getFilesDir());
+            File[] old = new File(getCacheDir(), "apk").listFiles(); // an earlier new-version download
+            if (old != null) for (File f : old) f.delete();
             try {
                 updater = new Updater(new File(getFilesDir(), "update"),
                         Updater.read(getAssets().open("site/" + Updater.MANIFEST), 10 << 20));
@@ -174,6 +187,7 @@ public class MainActivity extends Activity {
         if (state != null) web.restoreState(state);
         if (state != null || updateChecked) play();
         else checkForUpdates();
+        installStatus(getIntent());
     }
 
     /** Shows the games, and loads the start page unless the WebView already holds one. */
@@ -227,6 +241,10 @@ public class MainActivity extends Activity {
                 if (games > 0 && !isFinishing()) toast(games + (games == 1 ? " new game" : " new games"));
                 play();
             });
+            // Then, in the background, a new version of the app (at most every 6 hours; offline nothing happens).
+            if (appUpdate.check(URI.create(manifestUrl).resolve("/assets/app-latest.json").toString(), System.currentTimeMillis())) {
+                runOnUiThread(() -> web.evaluateJavascript("window.togPaint && togPaint()", null));
+            }
         }).start();
         long start = SystemClock.uptimeMillis();
         timer.post(new Runnable() {
@@ -304,6 +322,49 @@ public class MainActivity extends Activity {
             if (updater.begin(game)) new Thread(() -> updater.install(game, manifestUrl)).start();
         }
 
+        /** A newer version of the app to offer in the game list, as JSON with the download state, or "". */
+        @JavascriptInterface
+        public String appUpdate() {
+            JSONObject o = appUpdate.offer(versionCode(), System.currentTimeMillis());
+            try {
+                return o == null ? "" : new JSONObject(o.toString()).put("state", apkState)
+                        .put("done", apkProgress[0]).put("total", apkProgress[1]).toString();
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        /** "Update" on the banner: downloads the new APK, checks it, then asks Android to install it. */
+        @JavascriptInterface
+        public void appUpdateStart() {
+            JSONObject o = appUpdate.offer(versionCode(), System.currentTimeMillis());
+            if (o == null || apkState.equals("busy")) return;
+            apkState = "busy";
+            new Thread(() -> {
+                try {
+                    File apk = AppUpdate.download(o, new File(getCacheDir(), "apk"), apkProgress);
+                    PackageInfo p = getPackageManager().getPackageArchiveInfo(apk.getPath(), 0);
+                    if (p == null || !getPackageName().equals(p.packageName) || versionCode(p) != o.getLong("versionCode")) {
+                        apk.delete();
+                        throw new IOException("not the app's new version");
+                    }
+                    apkState = "";
+                    runOnUiThread(() -> MainActivity.this.install(apk));
+                } catch (Exception e) {
+                    apkState = "failed";
+                    toast("The update could not be downloaded. Try again later.");
+                }
+            }).start();
+        }
+
+        /** "Later": hides the banner for this version for 24 hours. */
+        @JavascriptInterface
+        public void appUpdateLater() {
+            JSONObject o = appUpdate.offer(versionCode(), System.currentTimeMillis());
+            if (o != null) appUpdate.later(o.optLong("versionCode"), System.currentTimeMillis());
+            apkState = "";
+        }
+
         /** Its update failed (offline): play the installed copy of that game until the app restarts. */
         @JavascriptInterface
         public void playInstalled(String game) {
@@ -349,6 +410,73 @@ public class MainActivity extends Activity {
             toast("Could not save the file. Use Copy text instead.");
             return "";
         }
+    }
+
+    @SuppressWarnings("deprecation")
+    long versionCode(PackageInfo p) {
+        return Build.VERSION.SDK_INT >= 28 ? p.getLongVersionCode() : p.versionCode;
+    }
+
+    long versionCode() {
+        try {
+            return versionCode(getPackageManager().getPackageInfo(getPackageName(), 0));
+        } catch (Exception e) {
+            return Long.MAX_VALUE; // never offer an update we cannot compare
+        }
+    }
+
+    /**
+     * Hands a checked APK to Android's installer (PackageInstaller session, Android 5 and newer), which shows its own
+     * install prompt. Without the "install unknown apps" permission, its settings screen opens first; onResume retries.
+     */
+    void install(File apk) {
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            pendingApk = apk;
+            toast("Allow ThatOneGame to install its updates, then come back.");
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+            } catch (ActivityNotFoundException e) {
+                pendingApk = null;
+            }
+            return;
+        }
+        try {
+            PackageInstaller pi = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            params.setAppPackageName(getPackageName());
+            try (PackageInstaller.Session session = pi.openSession(pi.createSession(params))) {
+                try (OutputStream out = session.openWrite("base.apk", 0, apk.length()); InputStream in = new FileInputStream(apk)) {
+                    byte[] b = new byte[65536];
+                    for (int n; (n = in.read(b)) > 0; ) out.write(b, 0, n);
+                    session.fsync(out);
+                }
+                Intent done = new Intent(this, MainActivity.class).setAction(INSTALLED);
+                session.commit(PendingIntent.getActivity(this, 0, done,
+                        PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0)).getIntentSender());
+            }
+        } catch (Exception e) {
+            toast("The update could not be installed.");
+        }
+    }
+
+    /** The installer's answer: show its prompt, or say it did not install (cancelled, or failed). */
+    @SuppressWarnings("deprecation")
+    void installStatus(Intent i) {
+        if (i == null || !INSTALLED.equals(i.getAction())) return;
+        setIntent(new Intent(this, MainActivity.class)); // handled once
+        int status = i.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = i.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) startActivity(confirm);
+        } else if (status != PackageInstaller.STATUS_SUCCESS) {
+            toast("The update was not installed.");
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        installStatus(i);
     }
 
     /** Writes a file into the shared Downloads folder through MediaStore (Android 10+, no permission needed). */
@@ -477,6 +605,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        File apk = pendingApk; // back from the "install unknown apps" settings
+        pendingApk = null;
+        if (apk != null && (Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls())) install(apk);
         web.onResume();
         timer.postDelayed(tick, BACKUP_EVERY);
     }

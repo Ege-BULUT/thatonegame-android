@@ -12,5 +12,5 @@ O=$(mktemp -d)
 mkdir -p "$O/new" "$O/old" "$O/oldsrc"
 git show 76d3948:src/io/github/egebulut/thatonegame/Updater.java > "$O/oldsrc/Updater.java"
 "$JAVA/javac" -cp "$JSON" -d "$O/old" "$O/oldsrc/Updater.java"
-"$JAVA/javac" -cp "$JSON" -d "$O/new" src/io/github/egebulut/thatonegame/Updater.java test/io/github/egebulut/thatonegame/UpdaterTest.java
+"$JAVA/javac" -cp "$JSON" -d "$O/new" src/io/github/egebulut/thatonegame/Updater.java src/io/github/egebulut/thatonegame/AppUpdate.java test/io/github/egebulut/thatonegame/UpdaterTest.java
 "$JAVA/java" -Dtools="$TOOLS" -Dold="$O/old" -Djson="$JSON" -cp "$O/new:$JSON" io.github.egebulut.thatonegame.UpdaterTest

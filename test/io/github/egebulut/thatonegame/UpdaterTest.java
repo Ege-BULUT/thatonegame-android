@@ -180,6 +180,35 @@ public class UpdaterTest {
                     && text((File) local.invoke(old, "index.html")).contains("home v4"), "old app: updates every changed file from format 1");
             check(!hits.containsKey("/assets/app-manifest-v2.json") && !hits.containsKey("/games/wip/"), "old app: never fetches the new manifest");
         }
+        // A new version of the app itself (AppUpdate): the 6-hour check, the version compare, Later, the sha256 check.
+        File ad = Files.createTempDirectory("app").toFile();
+        String lu = root + "/assets/app-latest.json", body = "a new apk, release-signed";
+        served.put("/apk/new.apk", body.getBytes(StandardCharsets.UTF_8));
+        served.put("/assets/app-latest.json", ("{\"versionCode\":15,\"versionName\":\"3.0.2\",\"url\":\"" + root + "/apk/new.apk\",\"sha256\":\""
+                + sha(body) + "\",\"size\":" + body.length() + ",\"notes\":\"\"}").getBytes(StandardCharsets.UTF_8));
+        AppUpdate au = new AppUpdate(ad);
+        long t0 = 1_800_000_000_000L, h = 3600_000L;
+        hits.clear();
+        check(au.offer(14, t0) == null && au.check(lu, t0) && au.offer(14, t0).getString("versionName").equals("3.0.2"), "new app version: found, offered to an older app");
+        check(au.offer(15, t0) == null && au.offer(16, t0) == null, "not offered to the same or a newer app");
+        check(!au.check(lu, t0 + 5 * h) && hits.get("/assets/app-latest.json") == 1, "checked at most every 6 hours");
+        check(au.check(lu, t0 + 6 * h) && hits.get("/assets/app-latest.json") == 2, "after 6 hours it checks again");
+        au.later(15, t0 + 6 * h);
+        check(au.offer(14, t0 + 29 * h) == null && au.offer(14, t0 + 30 * h) != null, "Later hides it for 24 hours");
+        long[] prog = new long[2];
+        File newApk = AppUpdate.download(au.offer(14, t0 + 30 * h), ad, prog);
+        check(text(newApk).equals(body) && prog[0] == prog[1] && prog[1] == body.length(), "the new APK downloads and matches its sha256");
+        served.put("/apk/new.apk", "a bad apk, same length here".substring(0, body.length()).getBytes(StandardCharsets.UTF_8));
+        check(threw(() -> AppUpdate.download(au.offer(14, t0 + 30 * h), ad, new long[2])) && !newApk.exists() && !new File(ad, "update.tmp").exists(),
+                "a bad sha256: the APK is deleted, so it can never be installed");
+        served.put("/apk/new.apk", body.getBytes(StandardCharsets.UTF_8));
+        cut = "/apk/new.apk";
+        check(threw(() -> AppUpdate.download(au.offer(14, t0 + 30 * h), ad, new long[2])) && !newApk.exists() && !new File(ad, "update.tmp").exists(),
+                "a cut download: deleted");
+        cut = null;
+        served.put("/assets/app-latest.json", "{\"versionCode\":99}".getBytes(StandardCharsets.UTF_8));
+        check(!au.check(lu, t0 + 40 * h) && au.offer(14, t0 + 40 * h).getLong("versionCode") == 15, "a broken app-latest.json is ignored");
+
         check(u.update(url) == 0 && text(u.local("index.html")).contains("home v4"), "the next start installs the shell");
 
         // Offline: a game never downloaded cannot open; an outdated game plays its installed copy.
@@ -189,6 +218,7 @@ public class UpdaterTest {
         server.stop(0);
         long t = System.nanoTime();
         check(new Updater(dir, bundled).update(url) == -1 && System.nanoTime() - t < 4e9, "offline start: skips at once");
+        check(!new AppUpdate(Files.createTempDirectory("app2").toFile()).check(root + "/assets/app-latest.json", 0), "offline: no new-version check, nothing saved");
         check(!open(u, "games/c/index.html", url), "offline, never downloaded: the download fails");
         JSONObject c = status(u, "games/c/");
         check(c.getString("s").equals("get") && !c.getBoolean("installed") && c.has("error") && gone(u, "games/c/index.html")
