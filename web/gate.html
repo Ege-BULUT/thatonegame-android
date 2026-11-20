@@ -31,7 +31,7 @@
   var app = window.TOGApp || (parent !== window && parent.TOGApp);
   var key = (location.pathname.match(/^\/((games|io)\/[^\/]+\/)/) || [])[1];
   var $ = function (id) { return document.getElementById(id); };
-  var mb = function (n) { return n < 5e4 ? '<0.1 MB' : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB'; };
+  var mb = function (n) { var m = n / 1048576; return m < 1 ? Math.min(1023, Math.max(1, Math.round(n / 1024))) + ' KB' : m.toFixed(m < 10 ? 1 : 0) + ' MB'; }; // under 1 MB in whole KB, never 0
   $('thumb').src = '/' + key + 'thumb.png';
   fetch('/assets/games.json').then(function (r) { return r.json(); }).then(function (d) {
     var g = d.games.filter(function (x) { return x.path === '/' + key; })[0];

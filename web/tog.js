@@ -25,7 +25,7 @@
   ].join('');
   document.head.appendChild(css);
 
-  var mb = function (n) { return n < 5e4 ? '<0.1 MB' : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB'; };
+  var mb = function (n) { var m = n / 1048576; return m < 1 ? Math.min(1023, Math.max(1, Math.round(n / 1024))) + ' KB' : m.toFixed(m < 10 ? 1 : 0) + ' MB'; }; // under 1 MB in whole KB, never 0
   var games = {}, errors = {}, timer = 0;
 
   function paint() {
