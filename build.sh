@@ -18,19 +18,21 @@ CODE="${CODE:-1}"
 
 rm -rf build assets
 mkdir -p build/classes build/dex assets
-# The app packs exactly the files in the site's app manifest (tools/offline_list.py writes it): the deployed site
-# without the admin pages. Each one must still match its sha256, so the app's update check starts from the truth.
+# The app packs exactly the shell files of the site's app manifest (tools/offline_list.py writes it): the pages, game
+# list, thumbnails and shared libraries, not the games, which download when first opened. Each file must still match
+# its sha256, so the app's update check starts from the truth.
 python3 - "$SITE" assets/site <<'EOF'
 import hashlib, json, os, shutil, sys
 src, dst = sys.argv[1:]
-name = 'assets/app-manifest.json'
-for p, f in json.load(open(os.path.join(src, name)))['files'].items():
+name = 'assets/app-manifest-v2.json'
+for p, f in json.load(open(os.path.join(src, name)))['shell']['files'].items():
     os.makedirs(os.path.dirname(os.path.join(dst, p)), exist_ok=True)
     shutil.copyfile(os.path.join(src, p), os.path.join(dst, p))
     if hashlib.sha256(open(os.path.join(dst, p), 'rb').read()).hexdigest() != f['sha256']:
         sys.exit(p + ' changed after ' + name + ' was written: run python3 tools/offline_list.py in the site first')
 shutil.copyfile(os.path.join(src, name), os.path.join(dst, name))
 EOF
+cp -R web assets/tog # the app's own pages: the download screen and the game list's download buttons
 
 MANIFEST=AndroidManifest.xml DEBUG_MODE=
 if [ "${DEBUG:-}" = 1 ]; then # debuggable, and plain http allowed for the local test server

@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- The app serves this in place of a game page while that game downloads or updates (Updater.gate). It is never
+     part of the site: when the game is ready it reloads, and the game itself opens at the same address. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Downloading - ThatOneGame</title>
+<link rel="stylesheet" href="/assets/site.css">
+<style>
+  body { margin: 0; background: var(--page); }
+  .mstart { background: radial-gradient(circle at 50% 20%, #26324f, var(--page) 75%); }
+  .tog-bar { width: min(300px, 70vw); height: 12px; margin: 14px auto 8px; background: #2a2a2a; border: 1px solid #000; border-radius: 6px; overflow: hidden; }
+  .tog-bar i { display: block; height: 100%; width: 0; background: linear-gradient(var(--accent-2), var(--accent)); transition: width .2s; }
+  .tog-bar.wait i { width: 30%; animation: tog-wait 1.2s ease-in-out infinite alternate; }
+  @keyframes tog-wait { to { margin-left: 70%; } }
+  #msg { min-height: 1.4em; color: #c9d3f2; }
+  #retry[hidden], .tog-bar[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="mstart" id="tog-gate"><div>
+  <div class="shot"><img id="thumb" alt="" style="width:100%;height:100%;object-fit:cover"></div>
+  <h1 id="title"></h1>
+  <div class="tog-bar wait" id="bar"><i></i></div>
+  <p id="msg">Getting the game ready</p>
+  <button class="btn" id="retry" hidden>Try again</button>
+</div></div>
+<script>
+(function () {
+  var app = window.TOGApp || (parent !== window && parent.TOGApp);
+  var key = (location.pathname.match(/^\/((games|io)\/[^\/]+\/)/) || [])[1];
+  var $ = function (id) { return document.getElementById(id); };
+  var mb = function (n) { return n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + ' KB' : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB'; };
+  $('thumb').src = '/' + key + 'thumb.png';
+  fetch('/assets/games.json').then(function (r) { return r.json(); }).then(function (d) {
+    var g = d.games.filter(function (x) { return x.path === '/' + key; })[0];
+    if (g) { $('title').textContent = g.title; document.title = g.title + ' - ThatOneGame'; }
+  }).catch(function () {});
+  function state() { try { return JSON.parse(app.games())[key] || {}; } catch (e) { return {}; } }
+  var started = false;
+  function tick() {
+    var s = state();
+    if (s.s === 'ready') return location.reload();
+    if (s.s === 'busy') {
+      started = true;
+      $('bar').hidden = false;
+      $('bar').className = 'tog-bar' + (s.total ? '' : ' wait');
+      $('bar').firstChild.style.width = s.total ? Math.round(s.done * 100 / s.total) + '%' : '';
+      $('msg').textContent = (s.installed ? 'Updating' : 'Downloading') + (s.total ? ' · ' + mb(s.done) + ' of ' + mb(s.total) : '');
+      return setTimeout(tick, 250);
+    }
+    if (started && s.error !== undefined) {
+      // Offline or the download failed: an installed copy plays as it is; a game never downloaded needs the internet.
+      if (s.installed) { app.playInstalled(key); return location.reload(); }
+      $('bar').hidden = true;
+      $('msg').textContent = 'This game needs the internet the first time it opens. Connect and tap Try again.';
+      $('retry').hidden = false;
+      started = false;
+      return;
+    }
+    started = true;
+    app.install(key);
+    setTimeout(tick, 100);
+  }
+  $('retry').onclick = function () { $('retry').hidden = true; $('msg').textContent = 'Getting the game ready'; tick(); };
+  if (app && key) tick();
+})();
+</script>
+</body>
+</html>

@@ -36,6 +36,7 @@ import android.widget.Toast;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -48,9 +49,10 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Plays the ThatOneGame mobile site offline. The whole site is packed into assets/site and served
- * from a fake https origin, so absolute paths, ES modules and localStorage work as on the web.
- * On start it fetches the files the live site changed since (see Updater) and serves those instead.
+ * Plays the ThatOneGame mobile site. The site's shell (pages, game list, thumbnails, shared libraries) is packed into
+ * assets/site and served from a fake https origin, so absolute paths, ES modules and localStorage work as on the web.
+ * On start it fetches the shell files the live site changed since; each game downloads when it is first opened and
+ * updates only when it is opened or its update button is tapped (see Updater). A downloaded game plays offline.
  * Game saves live in that origin's localStorage; the app mirrors it to a file in its own storage and
  * puts it back if the WebView's data is ever cleared (see backup and restore).
  */
@@ -89,6 +91,7 @@ public class MainActivity extends Activity {
 
     static Updater updater; // one per app process
     static boolean updateChecked; // at most one update check per launch
+    static String manifestUrl; // the site's manifest; games download from the same site
 
     WebView web;
     boolean playing;
@@ -164,6 +167,10 @@ public class MainActivity extends Activity {
                 throw new IllegalStateException("the APK has no site manifest: build it with build.sh", e);
             }
         }
+        manifestUrl = SITE + Updater.MANIFEST;
+        String test = getIntent().getStringExtra("manifest");
+        // Only a test build (DEBUG=1 ./build.sh) takes another manifest URL, such as a local server (see README).
+        if (test != null && (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) manifestUrl = test;
         if (state != null) web.restoreState(state);
         if (state != null || updateChecked) play();
         else checkForUpdates();
@@ -178,12 +185,9 @@ public class MainActivity extends Activity {
         if (web.getUrl() == null) web.loadUrl(START);
     }
 
-    /** The short start screen: checks the site for changed files and downloads them, then opens the games. */
+    /** The short start screen: checks the site for changed shell files and downloads them, then opens the games. */
     void checkForUpdates() {
         updateChecked = true;
-        String url = SITE + Updater.MANIFEST, test = getIntent().getStringExtra("manifest");
-        // Only a test build (DEBUG=1 ./build.sh) takes another manifest URL, such as a local server (see README).
-        if (test != null && (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) url = test;
         float dp = getResources().getDisplayMetrics().density;
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -217,11 +221,10 @@ public class MainActivity extends Activity {
         box.addView(skip, new LinearLayout.LayoutParams(wrap, wrap));
         setContentView(box);
         immersive();
-        String from = url;
         new Thread(() -> {
-            int games = updater.update(from);
+            int games = updater.update(manifestUrl);
             runOnUiThread(() -> {
-                if (games > 0 && !isFinishing()) toast("Updated: " + games + (games == 1 ? " game" : " games"));
+                if (games > 0 && !isFinishing()) toast(games + (games == 1 ? " new game" : " new games"));
                 play();
             });
         }).start();
@@ -230,11 +233,11 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (playing || isFinishing() || isDestroyed()) return;
-                long total = updater.total;
+                long total = updater.start[1];
                 if (total > 0) {
                     text.setText("Updating");
                     bar.setIndeterminate(false);
-                    bar.setProgress((int) (updater.done * 1000 / total));
+                    bar.setProgress((int) (updater.start[0] * 1000 / total));
                 }
                 if (SystemClock.uptimeMillis() - start > 3000) skip.setVisibility(View.VISIBLE);
                 timer.postDelayed(this, 100);
@@ -242,17 +245,33 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** Maps a URL path to a packed file the way the web host does: "/x/" serves x/index.html, "/x" serves x.html. */
+    /**
+     * Maps a URL path to a site file the way the web host does: "/x/" serves x/index.html, "/x" serves x.html. A game
+     * page whose game must download or update first serves the app's download screen; site pages get the app's script
+     * for the game list's download and update buttons (assets/tog, from web/ in this repo).
+     */
     WebResourceResponse serve(String path) {
         if (path == null || path.isEmpty()) path = "/";
+        try {
+            if (path.equals("/__tog/tog.js")) return new WebResourceResponse("text/javascript", "utf-8", getAssets().open("tog/tog.js"));
+        } catch (IOException e) {
+            return null;
+        }
         String[] tries = path.endsWith("/")
                 ? new String[] { path + "index.html", path.substring(0, path.length() - 1) + ".html" }
                 : new String[] { path, path + ".html", path + "/index.html" };
         for (String p : tries) {
             try {
+                if (updater.gate(p.substring(1)) != null) return new WebResourceResponse("text/html", "utf-8", getAssets().open("tog/gate.html"));
                 InputStream in = open(p);
                 String ext = p.substring(p.lastIndexOf('.') + 1).toLowerCase();
                 String type = TYPES.containsKey(ext) ? TYPES.get(ext) : "application/octet-stream";
+                if (ext.equals("html") && updater.inShell(p.substring(1))) {
+                    String html = Updater.read(in, 10 << 20), tag = "<script src=\"/__tog/tog.js\" defer></script>";
+                    int end = html.lastIndexOf("</body>");
+                    html = end < 0 ? html + tag : html.substring(0, end) + tag + html.substring(end);
+                    in = new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8));
+                }
                 return new WebResourceResponse(type, type.startsWith("text/") || type.endsWith("json") ? "utf-8" : null, in);
             } catch (IOException missing) {
                 // try the next form of the path
@@ -265,14 +284,32 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** A site file: the updated copy when there is one, else the one packed in the APK. */
+    /** A site file: the downloaded copy when there is one, else the one packed in the APK. */
     InputStream open(String path) throws IOException {
         File f = updater.local(path.substring(1));
         return f != null ? new FileInputStream(f) : getAssets().open("site" + path);
     }
 
-    /** Called from the site (window.TOGApp). */
+    /** Called from the site (window.TOGApp) and from the app's own scripts in assets/tog. */
     class Bridge {
+        /** Every game's download state as JSON: {"games/<slug>/": {"s": "get|update|busy|ready", "bytes", ...}}. */
+        @JavascriptInterface
+        public String games() {
+            return updater.games();
+        }
+
+        /** Downloads or updates a game in the background, without opening it. games() shows the progress. */
+        @JavascriptInterface
+        public void install(String game) {
+            if (updater.begin(game)) new Thread(() -> updater.install(game, manifestUrl)).start();
+        }
+
+        /** Its update failed (offline): play the installed copy of that game until the app restarts. */
+        @JavascriptInterface
+        public void playInstalled(String game) {
+            if (game != null) updater.skip.add(game);
+        }
+
         /** Lock landscape while a landscape game runs, free rotation elsewhere. */
         @JavascriptInterface
         public void orient(String mode) {
